@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bus Route 6x6 (WS Hub)</title>
+  <style>
+    html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,sans-serif;background:#0d1117;color:#eaeef2}
+    #wrap{display:grid;grid-template-columns:360px 1fr;height:100%}
+    #panel{padding:12px;border-right:1px solid #2b3137;overflow:auto}
+    #canvas{display:block;width:100%;height:100%}
+    .row{display:grid;grid-template-columns:120px 1fr;gap:8px;margin-bottom:10px}
+    input,button,select{padding:8px 10px;border:1px solid #3a3f44;border-radius:10px;background:#151b23;color:#eaeef2}
+    button{cursor:pointer}
+    .pill{display:inline-block;background:#2b3137;padding:4px 10px;border-radius:999px;margin-right:6px;cursor:pointer}
+    .pill.active{background:#3b4652}
+    .note{font-size:12px;color:#9aa4ad}
+    #log{white-space:pre-line;font-size:12px;background:#0b0f14;padding:8px;border-radius:8px;max-height:240px;overflow:auto;border:1px solid #2b3137}
+    a{color:#9ecbff}
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="panel">
+    <div class="row"><label>허브 주소</label><input id="hub" value="ws://127.0.0.1:81"></div>
+    <div class="row"><label>연결</label>
+      <button id="btnConnect">Connect</button>
+      <button id="btnPing">Ping</button>
+    </div>
+    <div class="row"><label>장치 선택</label>
+      <select id="device"></select>
+    </div>
+    <div class="row"><label>픽업→드롭</label>
+      <button id="btnReq">요청 생성</button>
+    </div>
+    <p class="note">캔버스에서 먼저 빨간(픽업)→초록(드롭) 순으로 한 칸을 클릭하세요. 장치 목록은 디바이스가 허브에 접속해서 보낸 hello 메시지로 자동 등록됩니다.</p>
+    <div class="row"><label>로그</label><div id="log"></div></div>
+  </div>
+  <canvas id="canvas"></canvas>
+</div>
+
+<script>
+let W=0,H=0,Z=18;
+const cvs=document.getElementById('canvas'); const ctx=cvs.getContext('2d');
+let MAP=null, pickup=null, drop=null;
+let ws=null;
+const devices=new Map(); // id -> {type:'bus'|'signal'|'other'}
+
+function fit(){ cvs.width = window.innerWidth-360; cvs.height=window.innerHeight; W=cvs.width; H=cvs.height; drawAll(); }
+window.addEventListener('resize', fit);
+
+function log(s){ const el=document.getElementById('log'); el.textContent += s+"\n"; el.scrollTop=el.scrollHeight; }
+
+// Build 6x6 evenly spaced grid, keep nodes for snapping
+function buildGrid(grid=64, margin=8, nV=6, nH=6){
+  const N=grid, s=margin, e=N-margin-1;
+  function spaced(c){ const L=e-s, pos=[]; for(let k=1;k<=c;k++) pos.push(Math.round(s + (L*k)/(c+1))); return pos; }
+  const xs=spaced(nV), ys=spaced(nH);
+  const nodes={}, nodeByCoord=new Map(); let nid=0;
+  for(const x of xs){ for(const y of ys){ const id=String(nid++); nodes[id]={grid:[x,y]}; nodeByCoord.set(`${x},${y}`, id); } }
+  // adjacency (4-neigh only along rows/cols)
+  const edges=[];
+  for(let i=0;i<xs.length;i++){
+    for(let j=0;j<ys.length;j++){
+      const u = nodeByCoord.get(`${xs[i]},${ys[j]}`);
+      if(i<xs.length-1){ const v=nodeByCoord.get(`${xs[i+1]},${ys[j]}`); edges.push({u,v}); }
+      if(j<ys.length-1){ const v=nodeByCoord.get(`${xs[i]},${ys[j+1]}`); edges.push({u,v}); }
+    }
+  }
+  return {meta:{inner:[s,e],xs,ys}, nodes, edges};
+}
+
+function squareOrigin(inner){
+  const s=inner[0], e=inner[1]; const cells = (e-s+1); const sidePx=cells*Z;
+  return {ox:(W-sidePx)/2, oy:(H-sidePx)/2, sidePx, s, e};
+}
+
+function drawAll(){
+  if(!MAP) return;
+  ctx.clearRect(0,0,W,H);
+  const org = squareOrigin(MAP.meta.inner);
+  ctx.fillStyle='#0b0f14'; ctx.fillRect(org.ox, org.oy, org.sidePx, org.sidePx);
+
+  // draw grid
+  ctx.strokeStyle='#ffffff'; ctx.lineWidth=Math.max(2,Z*0.25);
+  for(const x of MAP.meta.xs){
+    const px=org.ox+(x-org.s)*Z+Z/2;
+    ctx.beginPath(); ctx.moveTo(px,org.oy+Z/2); ctx.lineTo(px,org.oy+org.sidePx-Z/2); ctx.stroke();
+  }
+  for(const y of MAP.meta.ys){
+    const py=org.oy+(y-org.s)*Z+Z/2;
+    ctx.beginPath(); ctx.moveTo(org.ox+Z/2,py); ctx.lineTo(org.ox+org.sidePx-Z/2,py); ctx.stroke();
+  }
+
+  // markers
+  if(pickup){
+    const {x,y}=pickup; const px=org.ox+(x-org.s)*Z+Z/2, py=org.oy+(y-org.s)*Z+Z/2;
+    ctx.fillStyle='#d32f2f'; ctx.beginPath(); ctx.arc(px,py, Z*0.35, 0, Math.PI*2); ctx.fill();
+  }
+  if(drop){
+    const {x,y}=drop; const px=org.ox+(x-org.s)*Z+Z/2, py=org.oy+(y-org.s)*Z+Z/2;
+    ctx.fillStyle='#2e7d32'; ctx.beginPath(); ctx.arc(px,py, Z*0.35, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+function nearestNode(gx,gy){
+  // gx,gy are absolute grid coords; find closest from meta.xs, meta.ys
+  let bx=MAP.meta.xs[0], by=MAP.meta.ys[0], bd=1e9;
+  for(const x of MAP.meta.xs){
+    for(const y of MAP.meta.ys){
+      const d = Math.abs(x-gx)+Math.abs(y-gy);
+      if(d<bd){bd=d;bx=x;by=y;}
+    }
+  }
+  return {x:bx, y:by};
+}
+
+cvs.addEventListener('click', e=>{
+  if(!MAP) return;
+  const r=cvs.getBoundingClientRect();
+  const org=squareOrigin(MAP.meta.inner);
+  const gx = Math.floor((e.clientX - r.left - org.ox)/Z) + org.s;
+  const gy = Math.floor((e.clientY - r.top  - org.oy)/Z) + org.s;
+  const {x,y} = nearestNode(gx,gy);
+  if(!pickup){ pickup={x,y}; log(`[UI] 픽업=(${x},${y})`); }
+  else if(!drop){ drop={x,y}; log(`[UI] 드롭=(${x},${y})`); }
+  else { pickup={x,y}; drop=null; log(`[UI] 픽업 재설정=(${x},${y})`); }
+  drawAll();
+});
+
+// ----- WebSocket control -----
+function addDevice(id, info){
+  devices.set(id, info);
+  const sel=document.getElementById('device');
+  const existed=[...sel.options].some(o=>o.value===id);
+  if(!existed){
+    const opt=document.createElement('option');
+    opt.value=id; opt.textContent=`${info.type}:${id}`;
+    sel.appendChild(opt);
+  }
+}
+
+function connect(){
+  const url=document.getElementById('hub').value.trim();
+  if(ws && ws.readyState===1) ws.close();
+  ws = new WebSocket(url);
+  ws.onopen = ()=>{ log(`[WS] open ${url}`); };
+  ws.onclose = (e)=>{ log(`[WS] close (${e.code})`); };
+  ws.onerror = (e)=>{ log(`[WS] error`); };
+  ws.onmessage = (ev)=>{
+    try{
+      const data=JSON.parse(ev.data);
+      if(data.type==="hello"){
+        addDevice(data.id || "unknown", {type:data.role || "bus"});
+        log(`[WS] hello from ${data.role}:${data.id}`);
+      }else if(data.type==="pong"){
+        log(`[WS] pong ts=${data.ts}`);
+      }else if(data.type==="pos"){
+        // You could draw live bus dot here (omitted for brevity)
+        // log(`[POS] ${data.bus} => (${data.i},${data.j})`);
+      }
+    }catch{ /* ignore non-JSON */ }
+  };
+}
+
+function sendRoute(){
+  if(!ws || ws.readyState!==1){ log("[WS] not connected"); return; }
+  if(!pickup || !drop){ log("[UI] 픽업/드롭 먼저 선택"); return; }
+  const id = document.getElementById('device').value;
+  if(!id){ log("[UI] 장치가 없습니다. (hello가 먼저 와야 함)"); return; }
+  // Route = Manhattan path: X-aligned then Y-aligned
+  const cell_ms = 800;
+  const payload = {
+    type:"route",
+    to:id,
+    cells:[{x:pickup.x, y:pickup.y},{x:drop.x, y:drop.y}],
+    cell_ms
+  };
+  ws.send(JSON.stringify(payload));
+  log(`[WS] route -> ${id} ${JSON.stringify(payload)}`);
+}
+
+document.getElementById('btnConnect').onclick=connect;
+document.getElementById('btnPing').onclick=()=>{
+  if(ws && ws.readyState===1){ ws.send(JSON.stringify({type:"ping"})); }
+};
+document.getElementById('btnReq').onclick=sendRoute;
+document.getElementById('hub').addEventListener('keydown', e=>{ if(e.key==='Enter') connect(); });
+
+function start(){
+  fit();
+  MAP = buildGrid(64,8,6,6);
+  // default connect to local hub
+  // connect();  // leave manual to avoid errors before server runs
+}
+window.addEventListener('load', start);
+</script>
+</body>
+</html>

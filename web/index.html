@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bus Optimal Route — Multi Passenger v6 + ESP32 Link (WebSocket)</title>
+<style>
+html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,sans-serif;background:#0d1117;color:#eaeef2}
+#wrap{display:grid;grid-template-columns:460px 1fr;height:100%}
+#panel{padding:12px;border-right:1px solid #2b3137;overflow:auto}
+#canvas{display:block;width:100%;height:100%}
+.row{display:grid;grid-template-columns:170px 1fr;gap:8px;margin-bottom:8px}
+input,button,textarea{padding:8px 10px;border:1px solid #3a3f44;border-radius:10px;background:#151b23;color:#eaeef2}
+button{cursor:pointer}
+.pill{display:inline-block;background:#2b3137;padding:4px 10px;border-radius:999px;margin-right:6px;cursor:pointer}
+.pill.active{background:#3b4652}
+.note{font-size:12px;color:#9aa4ad}
+#stats{margin-top:10px;padding:8px;border:1px dashed #3a3f44;border-radius:10px;font-size:13px;line-height:1.4}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#22324a;margin-right:6px;font-size:12px}
+#busList{margin-top:10px;border-top:1px solid #2b3137;padding-top:8px}
+.busRow{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border:1px solid #2b3137;border-radius:10px;margin-bottom:6px;background:#0f141b}
+.busLeft{display:flex;gap:8px;align-items:center}
+.colorDot{width:12px;height:12px;border-radius:999px;display:inline-block}
+.small{font-size:12px;color:#9aa4ad}
+#devices{font-family:ui-monospace,Consolas,monospace;height:100px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="panel">
+    <div class="row"><label>Zoom</label><input id="zoom" type="number" value="18"></div>
+    <div class="row"><label>버스 등록</label><button id="reg">도로 클릭</button></div>
+    <div class="row"><label>요청 생성</label><button id="req">픽업→드롭</button></div>
+    <div class="row"><label>표시</label><span class="pill active" id="toggleRoute">RouteAnim</span></div>
+    <div class="row"><label>애니메이션</label><button id="play">Play</button> <button id="pause">Pause</button></div>
+
+    <p class="note">6×6 도로 / 다중 버스 / 신호등(회색 네모) / 버스별 통계 (v6) + <b>ESP32 WebSocket 연동</b></p>
+    <div id="err" style="color:#ff6b6b"></div>
+    <div id="stats">
+      <div><span class="badge">총 소요시간(최근 배차)</span><span id="statTotal">-</span></div>
+      <div><span class="badge">최장 탑승시간(전체)</span><span id="statLongest">-</span></div>
+      <div style="margin-top:6px"><span class="badge">상태</span><span id="statStatus">대기</span></div>
+    </div>
+
+    <h3>장치 연결</h3>
+    <div class="row"><label>장치 목록(JSON)</label>
+      <textarea id="devices">{
+  "buses": {
+    "bus-100": "ws://192.168.0.31:81/",
+    "bus-200": "ws://192.168.0.32:81/"
+  },
+  "signals": {
+    "n_0_0": "ws://192.168.0.51:81/",
+    "n_3_2": "ws://192.168.0.52:81/"
+  }
+}</textarea>
+    </div>
+    <div class="row"><label>연결</label>
+      <button id="btnConnect">모두 연결</button>
+    </div>
+
+    <div id="busList"></div>
+  </div>
+  <canvas id="canvas"></canvas>
+</div>
+
+<script>
+let W=0,H=0,Z=18;
+const cvs=document.getElementById('canvas');const ctx=cvs.getContext('2d');
+let showRoute=true, animOn=true, lastTick=0, routeDashOffset=0;
+
+const STATE={ buses:{}, requests:{}, stats:{longestRideSec:0} };
+let MAP=null; let tempPickup=null, tempDrop=null, mode=null; let pidSeq=1;
+const WS={ buses:{}, signals:{} };
+
+function connectAll(){
+  const txt=document.getElementById('devices').value;
+  let cfg={buses:{},signals:{}};
+  try{ cfg=JSON.parse(txt); }catch(e){ alert('JSON 파싱 오류: '+e); return; }
+  for(const [bid,url] of Object.entries(cfg.buses||{})){
+    const ws=new WebSocket(url);
+    WS.buses[bid]=ws;
+    ws.onopen = ()=>console.log('BUS WS open', bid);
+    ws.onclose= ()=>console.log('BUS WS close', bid);
+    ws.onerror= e=>console.log('BUS WS error', bid, e);
+    ws.onmessage = ev=>{
+      try{
+        const msg=JSON.parse(ev.data);
+        if(msg.type==='pos' && STATE.buses[bid]){
+          const b=STATE.buses[bid];
+          b.nodeIJ=[Number(msg.i), Number(msg.j)];
+        }
+      }catch(_){}
+    };
+  }
+  for(const [nid,url] of Object.entries(cfg.signals||{})){
+    const ws=new WebSocket(url);
+    WS.signals[nid]=ws;
+    ws.onopen = ()=>console.log('SIG WS open', nid);
+    ws.onclose= ()=>console.log('SIG WS close', nid);
+    ws.onerror= e=>console.log('SIG WS error', nid, e);
+  }
+  document.getElementById('statStatus').textContent='WS 연결 시도 중';
+}
+
+const SEG_METERS=20;
+const BUS_SPEED_MS=30000/3600;
+const EDGE_TIME_S=SEG_METERS/BUS_SPEED_MS;
+const PENALTY_PER_STOP = EDGE_TIME_S * 1.5;
+const BUS_COLORS=['#1565C0','#9C27B0','#009688','#EF6C00','#26C6DA','#8BC34A','#FF7043','#AB47BC','#5C6BC0','#26A69A'];
+
+function measureLayout(){
+  cvs.width=window.innerWidth-460; cvs.height=window.innerHeight;
+  W=cvs.width; H=cvs.height;
+  const intersections=7, marginPx=Math.round(Math.min(W,H)*0.08);
+  const usable=Math.min(W,H)-marginPx*2;
+  const cell=Math.max(18, Math.floor(usable/(intersections-1)));
+  const sidePx=cell*(intersections-1);
+  const ox=Math.floor((W-sidePx)/2), oy=Math.floor((H-sidePx)/2);
+  return {intersections, cell, sidePx, ox, oy};
+}
+function buildGraph(){
+  const L=measureLayout();
+  const nodes={}, edges=[], node_id=new Map(); let nid=0;
+  for(let j=0;j<L.intersections;j++){
+    for(let i=0;i<L.intersections;i++){
+      const id=String(nid++);
+      node_id.set(`${i},${j}`,id);
+      nodes[id]={ij:[i,j]};
+    }
+  }
+  for(let j=0;j<L.intersections;j++){
+    for(let i=0;i<L.intersections;i++){
+      if(i<L.intersections-1){
+        const u=node_id.get(`${i},${j}`), v=node_id.get(`${i+1},${j}`);
+        edges.push({u,v,time_s:EDGE_TIME_S});
+      }
+      if(j<L.intersections-1){
+        const u=node_id.get(`${i},${j}`), v=node_id.get(`${i},${j+1}`);
+        edges.push({u,v,time_s:EDGE_TIME_S});
+      }
+    }
+  }
+  MAP={gridN:L.intersections, cell:L.cell, sidePx:L.sidePx, ox:L.ox, oy:L.oy, nodes, edges};
+}
+function toPx(i,j){ return [MAP.ox+i*MAP.cell, MAP.oy+j*MAP.cell]; }
+function makeTables(){
+  const T={}, ADJ={};
+  for(const e of MAP.edges){
+    const U=MAP.nodes[e.u].ij, V=MAP.nodes[e.v].ij;
+    const ku=U[0]+','+U[1], kv=V[0]+','+V[1];
+    T[ku+':'+kv]=e.time_s; T[kv+':'+ku]=e.time_s;
+    (ADJ[ku]??=[]).push([kv, e.time_s]);
+    (ADJ[kv]??=[]).push([ku, e.time_s]);
+  }
+  return {T,ADJ};
+}
+function dijkstra(ADJ, srcIJ, dstIJ){
+  const key=(ij)=>ij[0]+','+ij[1];
+  const src=key(srcIJ), dst=key(dstIJ);
+  const dist={}, prev={}, pq=[[0,src]];
+  dist[src]=0; prev[src]=null;
+  while(pq.length){
+    pq.sort((a,b)=>a[0]-b[0]);
+    const [d,u]=pq.shift();
+    if(u===dst) break;
+    if(d!==dist[u]) continue;
+    for(const [v,w] of (ADJ[u]||[])){
+      const nd=d+w;
+      if(nd<(dist[v]??Infinity)){ dist[v]=nd; prev[v]=u; pq.push([nd,v]); }
+    }
+  }
+  if(!(dst in dist)) return {path:[], cost:Infinity};
+  const path=[]; let u=dst;
+  while(u!==null){ const [iS,jS]=u.split(',').map(Number); path.push([iS,jS]); u=prev[u]; }
+  path.reverse();
+  return {path, cost:dist[dst]};
+}
+function pathCost(ADJ, fromIJ, stops){
+  let cost=0, cur=fromIJ;
+  for(const ij of stops){
+    const r=dijkstra(ADJ, cur, ij);
+    if(!r.path.length) return Infinity;
+    cost += r.cost; cur=ij;
+  }
+  return cost;
+}
+function buildExpandedPath(ADJ, fromIJ, stops){
+  let cur=fromIJ; const full=[];
+  for(const ij of stops){
+    const r=dijkstra(ADJ, cur, ij);
+    if(!r.path.length) return [];
+    if(full.length===0) full.push(...r.path);
+    else full.push(...r.path.slice(1));
+    cur=ij;
+  }
+  return full;
+}
+
+const SIG_STATE = {};
+function setSignalsForPath(path){
+  for(const key of Object.keys(SIG_STATE)) SIG_STATE[key]='R';
+  for(const [i,j] of path){
+    const key='n_'+i+'_'+j;
+    SIG_STATE[key]='G';
+    const ws=WS.signals[key];
+    if(ws && ws.readyState===1){
+      ws.send(JSON.stringify({type:'light', state:'GREEN'}));
+    }
+  }
+  for(const [nid,ws] of Object.entries(WS.signals)){
+    if(ws && ws.readyState===1){
+      if(SIG_STATE[nid]!=='G') ws.send(JSON.stringify({type:'light', state:'RED'}));
+    }
+  }
+}
+
+function drawAll(){
+  if(!MAP) return;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#0b0f14'; ctx.fillRect(MAP.ox, MAP.oy, MAP.sidePx, MAP.sidePx);
+
+  ctx.strokeStyle='#ffffff'; ctx.lineWidth=Math.max(2, Z*0.25);
+  for(let i=0;i<MAP.gridN;i++){ const [x0,y0]=toPx(i,0), [x1,y1]=toPx(i,MAP.gridN-1); ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke(); }
+  for(let j=0;j<MAP.gridN;j++){ const [x0,y0]=toPx(0,j), [x1,y1]=toPx(MAP.gridN-1,j); ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke(); }
+
+  const s=Math.max(4,Z*0.35);
+  for(let i=0;i<MAP.gridN;i++){
+    for(let j=0;j<MAP.gridN;j++){
+      const [cx,cy]=toPx(i,j);
+      let col='#3b4652';
+      const key='n_'+i+'_'+j;
+      if(SIG_STATE[key]==='G') col='#2e7d32';
+      else if(SIG_STATE[key]==='R') col='#d32f2f';
+      ctx.fillStyle=col;
+      ctx.fillRect(cx-s/2, cy-s/2, s, s);
+    }
+  }
+
+  for(const req of Object.values(STATE.requests)){
+    if(req.status==='done') continue;
+    const [px,py]=toPx(...req.pickup);
+    ctx.fillStyle='#d32f2f'; ctx.beginPath(); ctx.arc(px,py,Math.max(4,Z*0.35),0,Math.PI*2); ctx.fill();
+    const [dx,dy]=toPx(...req.drop);
+    ctx.fillStyle='#2e7d32'; ctx.beginPath(); ctx.arc(dx,dy,Math.max(4,Z*0.35),0,Math.PI*2); ctx.fill();
+  }
+
+  if(showRoute){
+    for(const [bid,b] of Object.entries(STATE.buses)){
+      const A=b.anim; if(!A || A.path.length<2) continue;
+      ctx.lineWidth=Math.max(2, Z*0.5);
+      ctx.strokeStyle=b.riding ? '#ffcc33' : b.color;
+      ctx.setLineDash([Math.max(10,Z*0.8), Math.max(8,Z*0.6)]);
+      ctx.lineDashOffset=-routeDashOffset;
+      ctx.beginPath();
+      const [sx,sy]=toPx(...A.path[0]); ctx.moveTo(sx,sy);
+      for(let k=1;k<A.path.length;k++){ const [x,y]=toPx(...A.path[k]); ctx.lineTo(x,y); }
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  for(const [bid,b] of Object.entries(STATE.buses)){
+    let [xi,yj]=b.nodeIJ;
+    if(b.anim && b.anim.path.length>1){
+      const A=b.anim; const dur=A.segDur[A.segIdx]||1;
+      const a=Math.max(0,Math.min(1,(A.segT||0)/dur));
+      const [uI,uJ]=A.path[A.segIdx], [vI,vJ]=A.path[A.segIdx+1];
+      xi=uI*(1-a)+vI*a; yj=uJ*(1-a)+vJ*a;
+    }
+    const [cx,cy]=toPx(xi,yj);
+    ctx.fillStyle=b.riding ? '#fdd835' : b.color;
+    ctx.beginPath(); ctx.arc(cx,cy,Math.max(5,Z*0.35),0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font=`${Math.max(10,Z*0.5)}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('B',cx,cy);
+  }
+}
+
+function tick(ts){
+  if(!lastTick) lastTick=ts;
+  const dt=(ts-lastTick)/1000; lastTick=ts;
+  if(animOn) routeDashOffset=(routeDashOffset+dt*120)%1000;
+
+  const {ADJ}=makeTables();
+  for(const [bid,b] of Object.entries(STATE.buses)){
+    if(b.anim && b.anim.path.length>1){
+      b.totalMove = (b.totalMove||0) + dt;
+      const A=b.anim; const dur=A.segDur[A.segIdx]||1;
+      A.segT = (A.segT||0) + dt;
+      if(A.segT >= dur){
+        A.segT -= dur;
+        A.segIdx++;
+        const now=A.path[A.segIdx];
+        for(const req of Object.values(STATE.requests)){
+          if(req.assigned===bid && req.status==='waiting'){
+            if(now[0]===req.pickup[0] && now[1]===req.pickup[1]){ req.status='onboard'; req.rideElapsed=0; }
+          }
+        }
+        for(const req of Object.values(STATE.requests)){
+          if(req.assigned===bid && req.status==='onboard'){
+            if(now[0]===req.drop[0] && now[1]===req.drop[1]){
+              req.status='done';
+              b.longestRide = Math.max(b.longestRide||0, req.rideElapsed||0);
+              STATE.stats.longestRideSec = Math.max(STATE.stats.longestRideSec, req.rideElapsed||0);
+              b.arrivedCount = (b.arrivedCount||0) + 1;
+              document.getElementById('statLongest').textContent = `${STATE.stats.longestRideSec.toFixed(1)} s`;
+            }
+          }
+        }
+        b.riding = Object.values(STATE.requests).some(r=>r.assigned===bid && r.status==='onboard');
+        if(A.segIdx >= A.path.length-1){
+          b.nodeIJ=A.path[A.path.length-1].slice();
+          b.anim=null;
+          b.planStops=[];
+        }
+      }else{
+        for(const req of Object.values(STATE.requests)){
+          if(req.assigned===bid && req.status==='onboard'){ req.rideElapsed=(req.rideElapsed||0)+dt; }
+        }
+      }
+    }
+  }
+
+  drawAll();
+  updateBusList();
+  requestAnimationFrame(tick);
+}
+
+function currentNodeOfBus(b){ if(b.anim && b.anim.path.length>1) return b.anim.path[b.anim.segIdx].slice(); return b.nodeIJ.slice(); }
+function buildStopsFromRequests(busId){ const b=STATE.buses[busId]; return (b.planStops||[]).map(s=>s.slice()); }
+function computeCostForStops(busId,newStops,ADJ){ const b=STATE.buses[busId]; const cur=currentNodeOfBus(b); return pathCost(ADJ, cur, newStops); }
+function expandedFromStops(busId,stops,ADJ){ const b=STATE.buses[busId]; const cur=currentNodeOfBus(b); return buildExpandedPath(ADJ, cur, stops); }
+function insertRequestBest(busId, req, ADJ){
+  const baseStops=buildStopsFromRequests(busId);
+  const baseCost=computeCostForStops(busId, baseStops, ADJ);
+  let best=null;
+  for(let p=0;p<=baseStops.length;p++){
+    for(let q=p;q<=baseStops.length;q++){
+      const test=baseStops.slice();
+      test.splice(p,0,req.pickup.slice());
+      test.splice(q+1,0,req.drop.slice());
+      const c=computeCostForStops(busId, test, ADJ);
+      const delta=c-baseCost;
+      if(!best || delta<best.delta){ best={stops:test, delta, total:c, pending:baseStops.length}; }
+    }
+  }
+  return best;
+}
+function rebuildAnimation(busId, ADJ){
+  const b=STATE.buses[busId];
+  if(!b.planStops || b.planStops.length===0){ b.anim=null; return; }
+  const full=expandedFromStops(busId, b.planStops, ADJ);
+  if(full.length<2){ b.anim=null; return; }
+  const segDur=[]; for(let k=0;k<full.length-1;k++) segDur.push(EDGE_TIME_S);
+  b.anim={path:full, segIdx:0, segT:0, segDur};
+  sendRouteToBus(busId, full);
+  setSignalsForPath(full);
+}
+
+function toPx(i,j){ return [MAP.ox+i*MAP.cell, MAP.oy+j*MAP.cell]; }
+
+function snapToNode(mx,my){
+  const i=Math.round((mx-MAP.ox)/MAP.cell);
+  const j=Math.round((my-MAP.oy)/MAP.cell);
+  return [Math.max(0,Math.min(MAP.gridN-1,i)), Math.max(0,Math.min(MAP.gridN-1,j))];
+}
+cvs.addEventListener('click',(e)=>{
+  if(!MAP) return;
+  const r=cvs.getBoundingClientRect();
+  const [i,j]=snapToNode(e.clientX-r.left, e.clientY-r.top);
+  const {ADJ}=makeTables();
+
+  if(mode==='reg'){
+    const id='bus-'+Math.floor(Math.random()*900+100);
+    const color=BUS_COLORS[Object.keys(STATE.buses).length % BUS_COLORS.length];
+    STATE.buses[id]={nodeIJ:[i,j], anim:null, riding:false, planStops:[], color, arrivedCount:0, totalMove:0, longestRide:0};
+    document.getElementById('statStatus').textContent=`버스 등록 (${id})`;
+    mode=null; updateBusList(); drawAll(); return;
+  }
+  if(mode==='req'){
+    if(!tempPickup){
+      tempPickup={i,j};
+      document.getElementById('statStatus').textContent='픽업 선택됨';
+      drawAll(); return;
+    }
+    if(!tempDrop){
+      tempDrop={i,j};
+      const ids=Object.keys(STATE.buses);
+      if(ids.length===0){
+        document.getElementById('err').textContent='먼저 버스를 등록해줘.';
+        tempPickup=tempDrop=null; mode=null; return;
+      }
+      const rid='P'+(pidSeq++);
+      STATE.requests[rid]={pickup:[tempPickup.i,tempPickup.j], drop:[tempDrop.i,tempDrop.j], status:'waiting', assigned:null, rideElapsed:0};
+
+      let bestScore=Infinity, bestIns=null, bestBid=null;
+      for(const bid of ids){
+        const ins=insertRequestBest(bid, STATE.requests[rid], ADJ);
+        if(!ins) continue;
+        const score = ins.delta + PENALTY_PER_STOP * ins.pending;
+        if(score < bestScore){ bestScore=score; bestIns=ins; bestBid=bid; }
+      }
+      if(!bestBid){
+        document.getElementById('err').textContent='배차 실패.';
+        delete STATE.requests[rid]; tempPickup=tempDrop=null; mode=null; return;
+      }
+      const bid=bestBid;
+      STATE.requests[rid].assigned=bid;
+      const b=STATE.buses[bid];
+      b.planStops=bestIns.stops.map(s=>s.slice());
+      rebuildAnimation(bid, ADJ);
+      document.getElementById('statTotal').textContent=`${bestIns.total.toFixed(1)} s`;
+      document.getElementById('statStatus').textContent=`배차: ${bid}`;
+      tempPickup=tempDrop=null; mode=null; drawAll(); updateBusList();
+    }
+  }
+});
+document.getElementById('reg').onclick=()=>{mode='reg'; tempPickup=tempDrop=null;};
+document.getElementById('req').onclick=()=>{mode='req'; tempPickup=tempDrop=null;};
+document.getElementById('zoom').onchange=()=>{Z=parseInt(document.getElementById('zoom').value)||18; drawAll();};
+document.getElementById('toggleRoute').onclick=function(){showRoute=!showRoute; this.classList.toggle('active');};
+document.getElementById('play').onclick=()=>{animOn=true;};
+document.getElementById('pause').onclick=()=>{animOn=false;};
+
+function updateBusList(){
+  const box=document.getElementById('busList'); const rows=[];
+  for(const [bid,b] of Object.entries(STATE.buses)){
+    const onboard=Object.values(STATE.requests).filter(r=>r.assigned===bid && r.status==='onboard').length;
+    const waiting=Object.values(STATE.requests).filter(r=>r.assigned===bid && r.status==='waiting').length;
+    const status=b.anim ? (b.riding?'탑승 중':'운행 중') : '대기';
+    const arrived=b.arrivedCount||0;
+    const tMove=(b.totalMove||0).toFixed(1);
+    const tLongest=(b.longestRide||0).toFixed(1);
+    rows.push(`<div class="busRow">
+      <div class="busLeft">
+        <span class="colorDot" style="background:${b.color}"></span>
+        <strong>${bid}</strong>
+        <span class="small">승객 ${onboard} / 대기 ${waiting} / 도착 ${arrived}명</span>
+      </div>
+      <div class="small">${status}<br>최장 ${tLongest}s | 총 이동 ${tMove}s</div>
+    </div>`);
+  }
+  box.innerHTML=rows.join('');
+}
+
+function sendRouteToBus(bid, path){
+  const ws=WS.buses[bid];
+  if(!ws || ws.readyState!==1) return;
+  const pts=path.map(p=>({i:p[0], j:p[1]}));
+  ws.send(JSON.stringify({type:'route', path:pts, cell_ms: 900}));
+}
+
+function start(){
+  buildGraph();
+  STATE.buses["bus-100"]={nodeIJ:[0,0], anim:null, riding:false, planStops:[], color:'#1565C0', arrivedCount:0, totalMove:0, longestRide:0};
+  updateBusList();
+  requestAnimationFrame(tick);
+}
+
+document.getElementById('btnConnect').addEventListener('click', connectAll);
+window.addEventListener('resize', ()=>{ buildGraph(); drawAll(); });
+window.addEventListener('load', start);
+</script>
+</body>
+</html>
